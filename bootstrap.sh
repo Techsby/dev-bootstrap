@@ -44,6 +44,59 @@ write_file_if_missing() {
   printf '%s\n' "$content" >"$file"
 }
 
+linux_id() {
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    printf '%s\n' "${ID:-unknown}"
+  else
+    printf 'unknown\n'
+  fi
+}
+
+linux_id_like() {
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    printf '%s\n' "${ID_LIKE:-}"
+  fi
+}
+
+linux_family() {
+  local id
+  local id_like
+  id="$(linux_id)"
+  id_like=" $(linux_id_like) "
+
+  case "$id" in
+    debian|ubuntu|linuxmint|pop)
+      printf 'debian\n'
+      ;;
+    fedora|rhel|centos|rocky|almalinux)
+      printf 'fedora\n'
+      ;;
+    arch|cachyos|endeavouros|manjaro)
+      printf 'arch\n'
+      ;;
+    *)
+      case "$id_like" in
+        *" debian "*|*" ubuntu "*)
+          printf 'debian\n'
+          ;;
+        *" fedora "*|*" rhel "*)
+          printf 'fedora\n'
+          ;;
+        *" arch "*)
+          printf 'arch\n'
+          ;;
+        *)
+          printf 'unknown\n'
+          ;;
+      esac
+      ;;
+  esac
+}
+
 install_with_apt() {
   local packages=("$@")
   local missing=()
@@ -60,6 +113,92 @@ install_with_apt() {
     sudo apt-get update -y
     sudo apt-get install -y "${missing[@]}"
   fi
+}
+
+install_with_dnf() {
+  local packages=("$@")
+  local missing=()
+  local pkg
+
+  for pkg in "${packages[@]}"; do
+    if ! rpm -q "$pkg" >/dev/null 2>&1; then
+      missing+=("$pkg")
+    fi
+  done
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    log "Installing dnf packages: ${missing[*]}"
+    sudo dnf install -y "${missing[@]}"
+  fi
+}
+
+install_with_pacman() {
+  local packages=("$@")
+  local missing=()
+  local pkg
+
+  for pkg in "${packages[@]}"; do
+    if ! pacman -Q "$pkg" >/dev/null 2>&1; then
+      missing+=("$pkg")
+    fi
+  done
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    log "Installing pacman packages: ${missing[*]}"
+    sudo pacman -Sy --needed --noconfirm "${missing[@]}"
+  fi
+}
+
+install_linux_packages() {
+  local family
+  family="$(linux_family)"
+
+  log "Detected Linux distro: $(linux_id) (${family})"
+
+  case "$family" in
+    debian)
+      install_with_apt \
+        git zsh fzf curl ca-certificates build-essential unzip xz-utils \
+        make llvm libssl-dev zlib1g-dev libbz2-dev libreadline-dev \
+        libsqlite3-dev libncursesw5-dev tk-dev libxml2-dev libxmlsec1-dev \
+        libffi-dev liblzma-dev
+      ;;
+    fedora)
+      install_with_dnf \
+        git zsh fzf curl ca-certificates gcc gcc-c++ make patch unzip xz \
+        openssl-devel zlib-devel bzip2-devel readline-devel sqlite-devel \
+        ncurses-devel tk-devel libffi-devel xz-devel
+      ;;
+    arch)
+      install_with_pacman \
+        git zsh fzf curl ca-certificates base-devel unzip xz \
+        openssl zlib bzip2 readline sqlite ncurses tk libffi
+      ;;
+    *)
+      die "Unsupported Linux distro: $(linux_id). Supported families: Debian/Ubuntu, Fedora/RHEL, Arch/CachyOS."
+      ;;
+  esac
+}
+
+install_optional_linux_package() {
+  local package="$1"
+  local family
+  family="$(linux_family)"
+
+  case "$family" in
+    debian)
+      install_with_apt "$package"
+      ;;
+    fedora)
+      install_with_dnf "$package"
+      ;;
+    arch)
+      install_with_pacman "$package"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 is_windows_os() {
@@ -221,35 +360,47 @@ return {
 main() {
   log "Starting development environment bootstrap"
 
-  if ! command_exists curl; then
-    die "curl is required but not installed"
-  fi
-
   local os
   os="$(uname -s)"
   log "Detected OS: $os"
 
   if [[ "$os" == "Linux" ]]; then
-    install_with_apt git zsh fzf curl ca-certificates build-essential unzip xz-utils
+    install_linux_packages
+
+    if ! command_exists curl; then
+      die "curl is required but could not be installed"
+    fi
 
     if ! command_exists starship; then
-      log "Installing starship"
+      install_optional_linux_package starship || warn "Package 'starship' unavailable on this distro"
+    fi
+
+    if ! command_exists starship; then
+      log "Installing starship with upstream installer"
       curl -fsSL https://starship.rs/install.sh | sh -s -- -y
     fi
 
     if ! command_exists zoxide; then
-      log "Installing zoxide"
+      install_optional_linux_package zoxide || warn "Package 'zoxide' unavailable on this distro"
+    fi
+
+    if ! command_exists zoxide; then
+      log "Installing zoxide with upstream installer"
       curl -fsSL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | bash
     fi
 
     if ! command_exists eza; then
-      install_with_apt eza || warn "Package 'eza' unavailable on this distro"
+      install_optional_linux_package eza || warn "Package 'eza' unavailable on this distro"
     fi
 
     if ! command_exists bat; then
-      install_with_apt bat || warn "Package 'bat' unavailable on this distro"
+      install_optional_linux_package bat || warn "Package 'bat' unavailable on this distro"
     fi
   elif [[ "$os" == "Darwin" ]]; then
+    if ! command_exists curl; then
+      die "curl is required but not installed"
+    fi
+
     if ! command_exists brew; then
       log "Installing Homebrew"
       /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
